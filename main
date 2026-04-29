@@ -1,0 +1,830 @@
+import sys
+import subprocess
+import os
+
+# ==========================================
+# 🚀 АВТОМАТИЧЕСКАЯ УСТАНОВКА БИБЛИОТЕК
+# ==========================================
+# Этот блок должен быть в самом начале, ДО импорта aiogram и aiosqlite
+def auto_install_packages():
+    try:
+        import aiogram
+        import aiosqlite
+    except ImportError:
+        print("⏳ Внимание: Библиотеки aiogram или aiosqlite не найдены.")
+        print("⏳ Начинаю автоматическую установку (это займет около минуты)...")
+        try:
+            # Запускаем pip install через системный вызов
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "aiogram==3.4.1", "aiosqlite"])
+            print("✅ Библиотеки успешно установлены! Запускаю бота...")
+        except Exception as e:
+            print(f"❌ Критическая ошибка при установке: {e}")
+            sys.exit(1)
+
+# Вызываем автоустановку перед основным кодом
+auto_install_packages()
+
+# ==========================================
+# ОСНОВНОЙ КОД БОТА (ИМПОРТЫ)
+# ==========================================
+import asyncio
+import logging
+import random
+from typing import Dict, Any
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
+from aiogram.exceptions import TelegramBadRequest
+import aiosqlite
+
+# ==========================================
+# ⚙️ КОНФИГУРАЦИЯ И ЗАПУСК
+# ==========================================
+BOT_TOKEN = "8772087544:AAGENcPADFAVn6-QIea0XwfA70FO2DpE28M"
+DB_NAME = "tower_defense.db"
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Обычный запуск
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+# ==========================================
+# 📊 БАЗА ДАННЫХ
+# ==========================================
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.executescript('''
+            CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT);
+            CREATE TABLE IF NOT EXISTS moderators (user_id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS currencies (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS mobs (id INTEGER PRIMARY KEY AUTOINCREMENT, photo_id TEXT, hp INTEGER);
+            CREATE TABLE IF NOT EXISTS units (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, photo_id TEXT, rarity TEXT, name TEXT,
+                attack_type TEXT, cooldown INTEGER, damage INTEGER, placement_limit INTEGER, price INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS crates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+            CREATE TABLE IF NOT EXISTS crate_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, crate_id INTEGER, unit_id INTEGER, weight INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS battles (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, wave_count INTEGER);
+            CREATE TABLE IF NOT EXISTS battle_waves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, battle_id INTEGER, wave_number INTEGER,
+                mob_id INTEGER, mob_count INTEGER, turns_count INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS battle_rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, battle_id INTEGER, currency_id INTEGER, amount INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, unit_id INTEGER, is_equipped BOOLEAN DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS user_currencies (
+                user_id INTEGER, currency_id INTEGER, amount INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, currency_id)
+            );
+        ''')
+        await db.commit()
+
+async def is_admin(user_id: int) -> bool:
+    """Проверка прав. Первый вызвавший функцию становится главным админом."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT COUNT(*) FROM moderators') as cur:
+            mod_count = (await cur.fetchone())[0]
+        
+        if mod_count == 0:
+            await db.execute('INSERT INTO moderators (user_id) VALUES (?)', (user_id,))
+            await db.commit()
+            logging.info(f"Пользователь {user_id} назначен создателем/первым админом.")
+            return True
+            
+        async with db.execute('SELECT 1 FROM moderators WHERE user_id = ?', (user_id,)) as cur:
+            return bool(await cur.fetchone())
+
+# ==========================================
+# 📝 МАШИНЫ СОСТОЯНИЙ (FSM)
+# ==========================================
+class AdminMod(StatesGroup): add_mod = State(); del_mod = State()
+class AdminCurrency(StatesGroup): symbol = State()
+class AdminMob(StatesGroup): photo = State(); hp = State()
+class AdminUnit(StatesGroup): photo = State(); rarity = State(); name = State(); attack_type = State(); cooldown = State(); damage = State(); placement_limit = State(); price = State()
+class AdminCrate(StatesGroup): name = State(); select_unit = State(); unit_weight = State()
+class AdminBattle(StatesGroup): 
+    name = State()
+    wave_count = State()
+    wave_mob = State()
+    wave_mob_count = State()
+    wave_turns = State()
+    rewards_menu = State()
+    reward_amount = State()
+
+# Хранилище сессий боев
+active_battles: Dict[int, Dict[str, Any]] = {}
+
+# ==========================================
+# 🎹 КЛАВИАТУРЫ
+# ==========================================
+def cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]])
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚔️ Играть", callback_data="menu_play")],
+        [InlineKeyboardButton(text="📦 Крейты", callback_data="menu_crates"), InlineKeyboardButton(text="🎒 Инвентарь", callback_data="menu_inventory")],
+        [InlineKeyboardButton(text="🔧 Админ-панель", callback_data="admin_panel")]
+    ])
+
+def admin_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить модера", callback_data="adm_add_mod"), InlineKeyboardButton(text="➖ Удалить модера", callback_data="adm_del_mod")],
+        [InlineKeyboardButton(text="💰 Новая валюта", callback_data="adm_add_cur"), InlineKeyboardButton(text="👾 Создать моба", callback_data="adm_add_mob")],
+        [InlineKeyboardButton(text="👤 Создать юнита", callback_data="adm_add_unit"), InlineKeyboardButton(text="📦 Создать крейт", callback_data="adm_add_crate")],
+        [InlineKeyboardButton(text="🗺 Создать бой", callback_data="adm_add_battle")]
+    ])
+
+async def generate_items_kb(table: str, cb_prefix: str) -> InlineKeyboardMarkup:
+    async with aiosqlite.connect(DB_NAME) as db:
+        column = "symbol" if table == "currencies" else ("id" if table == "mobs" else "name")
+        async with db.execute(f'SELECT id, {column} FROM {table}') as cur:
+            items = await cur.fetchall()
+    kb = [[InlineKeyboardButton(text=f"[{row[0]}] {row[1]}", callback_data=f"{cb_prefix}_{row[0]}")] for row in items]
+    kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+# ==========================================
+# 🎮 ГЛАВНОЕ МЕНЮ И ПРОФИЛЬ
+# ==========================================
+@router.message(Command("start"))
+async def start_cmd(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    username = message.from_user.username or "Без_юзернейма"
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
+        await db.commit()
+        
+        # Собираем инфу о балансе пользователя
+        async with db.execute('''
+            SELECT c.symbol, uc.amount FROM user_currencies uc
+            JOIN currencies c ON uc.currency_id = c.id WHERE uc.user_id = ?
+        ''', (user_id,)) as cur:
+            balances = await cur.fetchall()
+
+    profile_text = f"👤 <b>Профиль игрока</b>\nID: <code>{user_id}</code>\nИмя: {message.from_user.first_name}\n\n<b>Баланс:</b>\n"
+    if balances:
+        for symbol, amount in balances:
+            profile_text += f"- {amount} {symbol}\n"
+    else:
+        profile_text += "- Пусто\n"
+
+    await message.answer(profile_text, reply_markup=main_menu_kb(), parse_mode="HTML")
+
+@router.callback_query(F.data == "cancel")
+async def cancel_handler(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Действие отменено. Возврат в главное меню.", reply_markup=main_menu_kb())
+
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel_handler(call: CallbackQuery):
+    if await is_admin(call.from_user.id):
+        await call.message.edit_text("🔧 <b>Админ-панель</b>\nВыберите действие:", reply_markup=admin_panel_kb(), parse_mode="HTML")
+    else:
+        await call.answer("❌ У вас нет прав!", show_alert=True)
+
+# ==========================================
+# 🔧 АДМИНКА: МОДЕРАТОРЫ
+# ==========================================
+@router.callback_query(F.data == "adm_add_mod")
+async def add_mod_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Отправь ID пользователя, перешли его сообщение, или введи @username:", reply_markup=cancel_kb())
+    await state.set_state(AdminMod.add_mod)
+
+@router.message(AdminMod.add_mod)
+async def add_mod_finish(message: Message, state: FSMContext):
+    user_id = None
+    if message.forward_origin:
+        if hasattr(message.forward_origin, 'sender_user') and message.forward_origin.sender_user:
+            user_id = message.forward_origin.sender_user.id
+    elif message.text.isdigit():
+        user_id = int(message.text)
+    elif message.text.startswith("@"):
+        username = message.text.replace("@", "")
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute('SELECT user_id FROM users WHERE username = ?', (username,)) as cur:
+                res = await cur.fetchone()
+                if res: user_id = res[0]
+
+    if not user_id:
+        return await message.answer("❌ Не удалось определить ID. Попробуй отправить просто числовой ID.")
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR IGNORE INTO moderators (user_id) VALUES (?)', (user_id,))
+        await db.commit()
+    await message.answer(f"✅ Пользователь {user_id} назначен модератором.", reply_markup=main_menu_kb())
+    await state.clear()
+
+@router.callback_query(F.data == "adm_del_mod")
+async def del_mod_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Отправь ID модератора для удаления:", reply_markup=cancel_kb())
+    await state.set_state(AdminMod.del_mod)
+
+@router.message(AdminMod.del_mod)
+async def del_mod_finish(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите числовой ID.")
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('DELETE FROM moderators WHERE user_id = ?', (int(message.text),))
+        await db.commit()
+    await message.answer("✅ Модератор удален.", reply_markup=main_menu_kb())
+    await state.clear()
+
+# ==========================================
+# 🔧 АДМИНКА: ВАЛЮТА И МОБЫ
+# ==========================================
+@router.callback_query(F.data == "adm_add_cur")
+async def add_cur_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Введите значок новой валюты (например: 💎, 🥇):", reply_markup=cancel_kb())
+    await state.set_state(AdminCurrency.symbol)
+
+@router.message(AdminCurrency.symbol)
+async def add_cur_finish(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_NAME) as db:
+        try:
+            await db.execute('INSERT INTO currencies (symbol) VALUES (?)', (message.text.strip(),))
+            await db.commit()
+            await message.answer("✅ Валюта добавлена.", reply_markup=main_menu_kb())
+        except aiosqlite.IntegrityError:
+            await message.answer("❌ Такая валюта уже существует.")
+    await state.clear()
+
+@router.callback_query(F.data == "adm_add_mob")
+async def add_mob_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Отправьте фото моба (как картинку):", reply_markup=cancel_kb())
+    await state.set_state(AdminMob.photo)
+
+@router.message(AdminMob.photo, F.photo)
+async def add_mob_photo(message: Message, state: FSMContext):
+    await state.update_data(photo=message.photo[-1].file_id)
+    await message.answer("Введите ХП моба (целое число):", reply_markup=cancel_kb())
+    await state.set_state(AdminMob.hp)
+
+@router.message(AdminMob.hp)
+async def add_mob_finish(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Число.")
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT INTO mobs (photo_id, hp) VALUES (?, ?)', (data['photo'], int(message.text)))
+        await db.commit()
+    await message.answer("✅ Моб создан!", reply_markup=main_menu_kb())
+    await state.clear()
+
+# ==========================================
+# 🔧 АДМИНКА: ЮНИТЫ
+# ==========================================
+@router.callback_query(F.data == "adm_add_unit")
+async def add_unit_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Отправьте фото юнита:", reply_markup=cancel_kb())
+    await state.set_state(AdminUnit.photo)
+
+@router.message(AdminUnit.photo, F.photo)
+async def add_unit_photo(message: Message, state: FSMContext):
+    await state.update_data(photo=message.photo[-1].file_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обычный", callback_data="rarity_Обычный"), InlineKeyboardButton(text="Редкий", callback_data="rarity_Редкий")],
+        [InlineKeyboardButton(text="Эпический", callback_data="rarity_Эпический"), InlineKeyboardButton(text="Легендарный", callback_data="rarity_Легендарный")]
+    ])
+    await message.answer("Выберите редкость:", reply_markup=kb)
+    await state.set_state(AdminUnit.rarity)
+
+@router.callback_query(AdminUnit.rarity, F.data.startswith("rarity_"))
+async def add_unit_rarity(call: CallbackQuery, state: FSMContext):
+    await state.update_data(rarity=call.data.split("_")[1])
+    await call.message.edit_text("Введите название юнита:", reply_markup=cancel_kb())
+    await state.set_state(AdminUnit.name)
+
+@router.message(AdminUnit.name)
+async def add_unit_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Ближний", callback_data="atk_melee"), InlineKeyboardButton(text="Дальний", callback_data="atk_ranged")]
+    ])
+    await message.answer("Выберите тип атаки:", reply_markup=kb)
+    await state.set_state(AdminUnit.attack_type)
+
+@router.callback_query(AdminUnit.attack_type, F.data.startswith("atk_"))
+async def add_unit_attack(call: CallbackQuery, state: FSMContext):
+    await state.update_data(attack_type=call.data.split("_")[1])
+    await call.message.edit_text("Введите КД (четное число, 2 = раз в 2 хода):", reply_markup=cancel_kb())
+    await state.set_state(AdminUnit.cooldown)
+
+@router.message(AdminUnit.cooldown)
+async def add_unit_cooldown(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0 or int(message.text) % 2 != 0:
+        return await message.answer("❌ Только четное положительное число.")
+    await state.update_data(cooldown=int(message.text))
+    await message.answer("Введите урон юнита:", reply_markup=cancel_kb())
+    await state.set_state(AdminUnit.damage)
+
+@router.message(AdminUnit.damage)
+async def add_unit_damage(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Число.")
+    await state.update_data(damage=int(message.text))
+    await message.answer("Введите лимит поставки (макс. на поле):", reply_markup=cancel_kb())
+    await state.set_state(AdminUnit.placement_limit)
+
+@router.message(AdminUnit.placement_limit)
+async def add_unit_limit(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Число.")
+    await state.update_data(placement_limit=int(message.text))
+    await message.answer("Введите цену поставки в бою (в монетах):", reply_markup=cancel_kb())
+    await state.set_state(AdminUnit.price)
+
+@router.message(AdminUnit.price)
+async def add_unit_finish(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Число.")
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            INSERT INTO units (photo_id, rarity, name, attack_type, cooldown, damage, placement_limit, price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (data['photo'], data['rarity'], data['name'], data['attack_type'], data['cooldown'], data['damage'], data['placement_limit'], int(message.text)))
+        await db.commit()
+    await message.answer("✅ Юнит добавлен в базу!", reply_markup=main_menu_kb())
+    await state.clear()
+
+# ==========================================
+# 🔧 АДМИНКА: КРЕЙТЫ
+# ==========================================
+@router.callback_query(F.data == "adm_add_crate")
+async def add_crate_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Введите название крейта:", reply_markup=cancel_kb())
+    await state.set_state(AdminCrate.name)
+
+@router.message(AdminCrate.name)
+async def add_crate_name(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute('INSERT INTO crates (name) VALUES (?)', (message.text,))
+        crate_id = cur.lastrowid
+        await db.commit()
+    await state.update_data(crate_id=crate_id)
+    await message.answer("Выберите юнита для ящика:", reply_markup=await generate_items_kb("units", "addcrateunit"))
+    await state.set_state(AdminCrate.select_unit)
+
+@router.callback_query(AdminCrate.select_unit, F.data.startswith("addcrateunit_"))
+async def add_crate_unit_select(call: CallbackQuery, state: FSMContext):
+    await state.update_data(current_unit=int(call.data.split("_")[1]))
+    await call.message.edit_text("Введите вес/шанс юнита (0-100):", reply_markup=cancel_kb())
+    await state.set_state(AdminCrate.unit_weight)
+
+@router.message(AdminCrate.unit_weight)
+async def add_crate_unit_weight(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Число.")
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT INTO crate_items (crate_id, unit_id, weight) VALUES (?, ?, ?)', (data['crate_id'], data['current_unit'], int(message.text)))
+        await db.commit()
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить еще юнита", callback_data="crate_add_more")],
+        [InlineKeyboardButton(text="✅ Завершить", callback_data="crate_finish")]
+    ])
+    await message.answer("Добавлено! Что дальше?", reply_markup=kb)
+
+@router.callback_query(F.data == "crate_add_more")
+async def crate_add_more(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Выберите юнита:", reply_markup=await generate_items_kb("units", "addcrateunit"))
+    await state.set_state(AdminCrate.select_unit)
+
+@router.callback_query(F.data == "crate_finish")
+async def crate_finish(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("✅ Крейт готов!", reply_markup=main_menu_kb())
+    await state.clear()
+
+# ==========================================
+# 🔧 АДМИНКА: БОИ (СЛОЖНАЯ ЛОГИКА НАГРАД)
+# ==========================================
+@router.callback_query(F.data == "adm_add_battle")
+async def bat_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Введите название карты:", reply_markup=cancel_kb())
+    await state.set_state(AdminBattle.name)
+
+@router.message(AdminBattle.name)
+async def bat_waves(message: Message, state: FSMContext):
+    await state.update_data(name=message.text, waves_data=[], rewards_data=[])
+    await message.answer("Введите кол-во волн:", reply_markup=cancel_kb())
+    await state.set_state(AdminBattle.wave_count)
+
+@router.message(AdminBattle.wave_count)
+async def bat_wave_init(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Число.")
+    await state.update_data(wave_count=int(message.text), current_wave=1)
+    await message.answer("Волна 1. Выберите моба:", reply_markup=await generate_items_kb("mobs", "addbatmob"))
+    await state.set_state(AdminBattle.wave_mob)
+
+@router.callback_query(AdminBattle.wave_mob, F.data.startswith("addbatmob_"))
+async def bat_wave_mob(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    data['waves_data'].append({"mob_id": int(call.data.split("_")[1])})
+    await state.update_data(waves_data=data['waves_data'])
+    await call.message.edit_text(f"Волна {data['current_wave']}. Введите кол-во мобов:", reply_markup=cancel_kb())
+    await state.set_state(AdminBattle.wave_mob_count)
+
+@router.message(AdminBattle.wave_mob_count)
+async def bat_wave_count(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Число.")
+    data = await state.get_data()
+    data['waves_data'][-1]['mob_count'] = int(message.text)
+    await state.update_data(waves_data=data['waves_data'])
+    await message.answer(f"Волна {data['current_wave']}. Введите кол-во ходов:", reply_markup=cancel_kb())
+    await state.set_state(AdminBattle.wave_turns)
+
+@router.message(AdminBattle.wave_turns)
+async def bat_wave_turns(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Число.")
+    data = await state.get_data()
+    data['waves_data'][-1]['turns_count'] = int(message.text)
+    
+    if data['current_wave'] < data['wave_count']:
+        data['current_wave'] += 1
+        await state.update_data(current_wave=data['current_wave'], waves_data=data['waves_data'])
+        await message.answer(f"Волна {data['current_wave']}. Выберите моба:", reply_markup=await generate_items_kb("mobs", "addbatmob"))
+        await state.set_state(AdminBattle.wave_mob)
+    else:
+        await state.update_data(waves_data=data['waves_data'])
+        await show_rewards_menu(message, state)
+
+async def show_rewards_menu(message_or_call, state: FSMContext):
+    """Показывает меню выбора наград с возможностью сброса и завершения."""
+    data = await state.get_data()
+    rewards_text = "<b>Выбранные награды:</b>\n"
+    if data['rewards_data']:
+        for r in data['rewards_data']:
+            rewards_text += f"- {r['amount']} {r['symbol']}\n"
+    else:
+        rewards_text += "- Пока нет\n"
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT id, symbol FROM currencies') as cur:
+            currencies = await cur.fetchall()
+            
+    kb = [[InlineKeyboardButton(text=f"Добавить {c[1]}", callback_data=f"addbatcur_{c[0]}_{c[1]}")] for c in currencies]
+    kb.append([InlineKeyboardButton(text="🔄 Сбросить валюты", callback_data="bat_reset_rewards")])
+    if data['rewards_data']:
+        kb.append([InlineKeyboardButton(text="✅ Завершить создание", callback_data="bat_finish_creation")])
+    kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+
+    text = f"Настройка наград за бой.\n\n{rewards_text}\nВыберите валюту для добавления:"
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    
+    if isinstance(message_or_call, Message):
+        await message_or_call.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await message_or_call.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await state.set_state(AdminBattle.rewards_menu)
+
+@router.callback_query(AdminBattle.rewards_menu, F.data.startswith("addbatcur_"))
+async def bat_reward_cur(call: CallbackQuery, state: FSMContext):
+    _, cur_id, cur_symbol = call.data.split("_")
+    await state.update_data(current_reward_id=int(cur_id), current_reward_symbol=cur_symbol)
+    await call.message.edit_text(f"Введите количество для {cur_symbol} (четное, >0):", reply_markup=cancel_kb())
+    await state.set_state(AdminBattle.reward_amount)
+
+@router.message(AdminBattle.reward_amount)
+async def bat_reward_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0 or int(message.text) % 2 != 0:
+        return await message.answer("❌ Четное положительное число.")
+    data = await state.get_data()
+    data['rewards_data'].append({
+        "currency_id": data['current_reward_id'],
+        "symbol": data['current_reward_symbol'],
+        "amount": int(message.text)
+    })
+    await state.update_data(rewards_data=data['rewards_data'])
+    await show_rewards_menu(message, state)
+
+@router.callback_query(AdminBattle.rewards_menu, F.data == "bat_reset_rewards")
+async def bat_reset_rewards(call: CallbackQuery, state: FSMContext):
+    await state.update_data(rewards_data=[])
+    await show_rewards_menu(call, state)
+
+@router.callback_query(AdminBattle.rewards_menu, F.data == "bat_finish_creation")
+async def bat_finish_all(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute('INSERT INTO battles (name, wave_count) VALUES (?, ?)', (data['name'], data['wave_count']))
+        battle_id = cur.lastrowid
+        for i, w in enumerate(data['waves_data']):
+            await db.execute('INSERT INTO battle_waves (battle_id, wave_number, mob_id, mob_count, turns_count) VALUES (?, ?, ?, ?, ?)',
+                             (battle_id, i+1, w['mob_id'], w['mob_count'], w['turns_count']))
+        for r in data['rewards_data']:
+            await db.execute('INSERT INTO battle_rewards (battle_id, currency_id, amount) VALUES (?, ?, ?)',
+                             (battle_id, r['currency_id'], r['amount']))
+        await db.commit()
+        
+    await call.message.edit_text("✅ Бой и все волны успешно созданы!", reply_markup=main_menu_kb())
+    await state.clear()
+
+# ==========================================
+# 🎒 ИГРА: ИНВЕНТАРЬ
+# ==========================================
+@router.callback_query(F.data == "menu_inventory")
+async def show_inv(call: CallbackQuery):
+    user_id = call.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('''
+            SELECT i.id, u.name, i.is_equipped FROM inventory i 
+            JOIN units u ON i.unit_id = u.id WHERE i.user_id = ?
+        ''', (user_id,)) as cur:
+            items = await cur.fetchall()
+            
+    if not items: return await call.message.edit_text("Инвентарь пуст.", reply_markup=main_menu_kb())
+        
+    kb = [[InlineKeyboardButton(text=f"{n} | {'✅' if eq else '❌'}", callback_data=f"eq_{iid}")] for iid, n, eq in items]
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="cancel")])
+    await call.message.edit_text("🎒 <b>Инвентарь:</b>\nЖми для экипировки (макс 5).", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("eq_"))
+async def toggle_eq(call: CallbackQuery):
+    inv_id = int(call.data.split("_")[1])
+    user_id = call.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT COUNT(*) FROM inventory WHERE user_id = ? AND is_equipped = 1', (user_id,)) as cur:
+            count = (await cur.fetchone())[0]
+        async with db.execute('SELECT is_equipped FROM inventory WHERE id = ?', (inv_id,)) as cur:
+            is_eq = (await cur.fetchone())[0]
+            
+        if not is_eq and count >= 5:
+            return await call.answer("❌ Максимум 5 юнитов!", show_alert=True)
+            
+        await db.execute('UPDATE inventory SET is_equipped = ? WHERE id = ?', (not is_eq, inv_id))
+        await db.commit()
+    await show_inv(call)
+
+# ==========================================
+# 📦 ИГРА: КРЕЙТЫ
+# ==========================================
+@router.callback_query(F.data == "menu_crates")
+async def crates_list(call: CallbackQuery):
+    await call.message.edit_text("📦 Выберите крейт:", reply_markup=await generate_items_kb("crates", "viewcrate"))
+
+@router.callback_query(F.data.startswith("viewcrate_"))
+async def crate_view(call: CallbackQuery):
+    c_id = int(call.data.split("_")[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT name FROM crates WHERE id = ?', (c_id,)) as cur:
+            c_name = (await cur.fetchone())[0]
+        async with db.execute('''
+            SELECT u.name, ci.weight FROM crate_items ci 
+            JOIN units u ON ci.unit_id = u.id WHERE ci.crate_id = ?
+        ''', (c_id,)) as cur:
+            items = await cur.fetchall()
+            
+    text = f"📦 <b>Крейт: {c_name}</b>\n\n" + "\n".join([f"- {n} (Вес: {w})" for n, w in items])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Открыть", callback_data=f"opencrate_{c_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_crates")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("opencrate_"))
+async def crate_open(call: CallbackQuery):
+    c_id = int(call.data.split("_")[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT unit_id, weight FROM crate_items WHERE crate_id = ?', (c_id,)) as cur:
+            items = await cur.fetchall()
+    
+    if not items: return await call.answer("Пустой крейт!", show_alert=True)
+    
+    total = sum(w for _, w in items)
+    rand = random.randint(1, total)
+    curr = 0
+    won_id = items[0][0]
+    for uid, w in items:
+        curr += w
+        if rand <= curr:
+            won_id = uid
+            break
+            
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT INTO inventory (user_id, unit_id) VALUES (?, ?)', (call.from_user.id, won_id))
+        async with db.execute('SELECT name FROM units WHERE id = ?', (won_id,)) as cur:
+            u_name = (await cur.fetchone())[0]
+        await db.commit()
+        
+    await call.answer(f"🎉 Выпало: {u_name}!", show_alert=True)
+    await crates_list(call)
+
+# ==========================================
+# ⚔️ ИГРА: БОЕВОЙ ДВИЖОК
+# ==========================================
+@router.callback_query(F.data == "menu_play")
+async def play_maps(call: CallbackQuery):
+    await call.message.edit_text("🗺 Выберите карту:", reply_markup=await generate_items_kb("battles", "startbat"))
+
+@router.callback_query(F.data.startswith("startbat_"))
+async def bat_start_engine(call: CallbackQuery):
+    b_id = int(call.data.split("_")[1])
+    user_id = call.from_user.id
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT name FROM battles WHERE id = ?', (b_id,)) as cur:
+            b_name = (await cur.fetchone())[0]
+        async with db.execute('SELECT wave_number, mob_id, mob_count, turns_count FROM battle_waves WHERE battle_id = ? ORDER BY wave_number', (b_id,)) as cur:
+            waves = await cur.fetchall()
+        async with db.execute('''
+            SELECT u.id, u.name, u.damage, u.cooldown, u.price, u.placement_limit 
+            FROM inventory i JOIN units u ON i.unit_id = u.id 
+            WHERE i.user_id = ? AND i.is_equipped = 1
+        ''', (user_id,)) as cur:
+            eq_units = await cur.fetchall()
+        async with db.execute('SELECT currency_id, amount FROM battle_rewards WHERE battle_id = ?', (b_id,)) as cur:
+            rewards = await cur.fetchall()
+
+    if not eq_units: return await call.answer("❌ Экипируйте юнитов!", show_alert=True)
+    if not waves: return await call.answer("❌ Нет волн в бою!", show_alert=True)
+
+    # Инициализация боевой сессии
+    active_battles[user_id] = {
+        "b_name": b_name,
+        "rewards": rewards,
+        "waves": waves,
+        "cur_wave": 0,
+        "coins": 50.0,
+        "placed": [],
+        "inv": eq_units,
+        "skip": False,
+        "msg": call.message,
+        "active": True,
+        "last_text": "",
+        "last_photo": None
+    }
+    await init_wave(user_id)
+
+async def init_wave(uid: int):
+    sess = active_battles.get(uid)
+    if not sess or not sess["active"]: return
+    
+    w_data = sess["waves"][sess["cur_wave"]]
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT photo_id, hp FROM mobs WHERE id = ?', (w_data[1],)) as cur:
+            m_data = await cur.fetchone()
+            
+    sess["m_photo"] = m_data[0]
+    sess["m_hp"] = m_data[1] * w_data[2]
+    sess["turns"] = w_data[3]
+    for p in sess["placed"]: p["cd"] = 0
+        
+    await render_ui(uid)
+    asyncio.create_task(turn_loop(uid))
+
+async def render_ui(uid: int):
+    sess = active_battles.get(uid)
+    if not sess: return
+    
+    text = (
+        f"⚔️ <b>{sess['b_name']}</b> | Волна {sess['cur_wave']+1}/{len(sess['waves'])}\n"
+        f"❤️ ХП врагов: {sess['m_hp']}\n"
+        f"⏳ Остаток ходов: {sess['turns']}\n"
+        f"====================\n"
+        f"💰 Монеты: {sess['coins']:.1f}\n"
+        f"🛡 Поставлено: {len(sess['placed'])}"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Поставить юнита", callback_data="bat_place")],
+        [InlineKeyboardButton(text="⏩ Автоскип (5с)" if not sess["skip"] else "⏸ Обычный (20с)", callback_data="bat_skip")]
+    ])
+    
+    if text == sess.get("last_text") and sess.get("last_photo") == sess["m_photo"]:
+        return
+
+    try:
+        if sess["last_photo"] != sess["m_photo"]:
+            await sess["msg"].delete()
+            sess["msg"] = await bot.send_photo(chat_id=sess["msg"].chat.id, photo=sess["m_photo"], caption=text, reply_markup=kb, parse_mode="HTML")
+            sess["last_photo"] = sess["m_photo"]
+        else:
+            await sess["msg"].edit_caption(caption=text, reply_markup=kb, parse_mode="HTML")
+        sess["last_text"] = text
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e): logging.error(e)
+
+@router.callback_query(F.data == "bat_skip")
+async def toggle_skip(call: CallbackQuery):
+    sess = active_battles.get(call.from_user.id)
+    if sess:
+        sess["skip"] = not sess["skip"]
+        sess["last_text"] = ""
+        await render_ui(call.from_user.id)
+    await call.answer()
+
+@router.callback_query(F.data == "bat_place")
+async def place_menu(call: CallbackQuery):
+    sess = active_battles.get(call.from_user.id)
+    if not sess: return await call.answer("Бой окончен")
+    
+    kb = []
+    for u in sess["inv"]:
+        cnt = sum(1 for p in sess["placed"] if p["id"] == u[0])
+        kb.append([InlineKeyboardButton(text=f"{u[1]} | {u[4]}💰 | {cnt}/{u[5]}", callback_data=f"bplace_{u[0]}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад в бой", callback_data="bat_back")])
+    
+    try:
+        await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except TelegramBadRequest: pass
+
+@router.callback_query(F.data == "bat_back")
+async def bat_back(call: CallbackQuery):
+    sess = active_battles.get(call.from_user.id)
+    if sess:
+        sess["last_text"] = ""
+        await render_ui(call.from_user.id)
+    await call.answer()
+
+@router.callback_query(F.data.startswith("bplace_"))
+async def do_place(call: CallbackQuery):
+    uid = int(call.data.split("_")[1])
+    sess = active_battles.get(call.from_user.id)
+    if not sess: return
+    
+    u_data = next((u for u in sess["inv"] if u[0] == uid), None)
+    if not u_data: return
+    
+    cnt = sum(1 for p in sess["placed"] if p["id"] == uid)
+    if sess["coins"] < u_data[4]: return await call.answer("❌ Нет монет!", show_alert=True)
+    if cnt >= u_data[5]: return await call.answer("❌ Лимит юнитов!", show_alert=True)
+        
+    sess["coins"] -= u_data[4]
+    sess["placed"].append({"id": uid, "dmg": u_data[2], "cd_max": u_data[3], "cd": 0})
+    await call.answer("✅ Поставлен!")
+    await place_menu(call)
+
+async def turn_loop(uid: int):
+    sess = active_battles.get(uid)
+    if not sess or not sess["active"]: return
+    
+    while sess["turns"] > 0 and sess["m_hp"] > 0 and sess["active"]:
+        await asyncio.sleep(5 if sess["skip"] else 20)
+        if not sess["active"]: break
+        
+        dmg = 0
+        for p in sess["placed"]:
+            p["cd"] += 1
+            if p["cd"] >= p["cd_max"]:
+                dmg += p["dmg"]
+                p["cd"] = 0
+                
+        sess["m_hp"] -= dmg
+        if sess["m_hp"] < 0: sess["m_hp"] = 0
+        sess["coins"] += dmg * 0.5
+        sess["turns"] -= 1
+        
+        await render_ui(uid)
+        
+    if sess["m_hp"] <= 0:
+        sess["cur_wave"] += 1
+        if sess["cur_wave"] >= len(sess["waves"]): await finish_bat(uid, True)
+        else: await init_wave(uid)
+    elif sess["turns"] <= 0:
+        await finish_bat(uid, False)
+
+async def finish_bat(uid: int, win: bool):
+    sess = active_battles.get(uid)
+    if not sess: return
+    sess["active"] = False
+    
+    res = "🎉 <b>ПОБЕДА!</b>\nНаграды:\n" if win else "💀 <b>ПОРАЖЕНИЕ (1/10 награды)</b>\nУтешительный приз:\n"
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        for cur_id, amt in sess["rewards"]:
+            final_amt = amt if win else max(1, amt // 10)
+            await db.execute('''
+                INSERT INTO user_currencies (user_id, currency_id, amount) 
+                VALUES (?, ?, ?) ON CONFLICT(user_id, currency_id) DO UPDATE SET amount = amount + ?
+            ''', (uid, cur_id, final_amt, final_amt))
+            
+            async with db.execute('SELECT symbol FROM currencies WHERE id = ?', (cur_id,)) as cur:
+                sym = (await cur.fetchone())[0]
+            res += f"- {final_amt} {sym}\n"
+        await db.commit()
+        
+    try:
+        await sess["msg"].edit_caption(caption=res, reply_markup=main_menu_kb(), parse_mode="HTML")
+    except: pass
+    del active_battles[uid]
+
+# ==========================================
+# ЗАПУСК БОТА
+# ==========================================
+async def main():
+    await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("Бот TOWER DEFENSE успешно запущен и готов к работе!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
