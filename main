@@ -66,7 +66,7 @@ IS_MAIN_BOT = len(sys.argv) == 1
 child_processes = []
 
 if IS_MAIN_BOT:
-    TOKEN = "8772087544:AAGENcPADFAVn6-QIea0XwfA70FO2DpE28M"
+    TOKEN = "8772087544:AAGQGHG23aRdRsjd4bBkEEns2kBfUf7tjqY"
     MAIN_ADMIN_ID = "1018561747"
     DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.json")
 else:
